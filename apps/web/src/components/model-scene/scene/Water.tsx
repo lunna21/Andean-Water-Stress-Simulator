@@ -121,6 +121,80 @@ function AquaticVegetation({
   return <primitive object={vegetation} />;
 }
 
+/**
+ * Build a densely tessellated mesh that fills the reservoir outline.
+ *
+ * THREE.ShapeGeometry only emits vertices around the perimeter, which leaves
+ * huge interior triangles. That makes per-vertex terrain sampling (used to
+ * carve the lake to the relief) very coarse. Here we lay down a regular grid
+ * across the shape bounding box and keep every quad whose centre falls inside
+ * the outline, giving us smooth interior data to drive the shoreline.
+ */
+function createTessellatedWaterGeometry(
+  shape: THREE.Shape,
+  resolution: number,
+) {
+  const outline = shape.getSpacedPoints(220);
+  const bounds = new THREE.Box2();
+  outline.forEach((point) => bounds.expandByPoint(point));
+
+  const sizeX = bounds.max.x - bounds.min.x;
+  const sizeY = bounds.max.y - bounds.min.y;
+  const cols = Math.max(2, Math.round(resolution * (sizeX / Math.max(sizeX, sizeY))));
+  const rows = Math.max(2, Math.round(resolution * (sizeY / Math.max(sizeX, sizeY))));
+
+  const center = new THREE.Vector2();
+
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+  const vertexIndex = new Map<number, number>();
+
+  const keyFor = (ix: number, iy: number) => iy * (cols + 1) + ix;
+
+  const addVertex = (ix: number, iy: number) => {
+    const key = keyFor(ix, iy);
+    const existing = vertexIndex.get(key);
+    if (existing !== undefined) return existing;
+
+    const x = bounds.min.x + (ix / cols) * sizeX;
+    const y = bounds.min.y + (iy / rows) * sizeY;
+    const index = positions.length / 3;
+    positions.push(x, y, 0);
+    uvs.push(ix / cols, iy / rows);
+    vertexIndex.set(key, index);
+    return index;
+  };
+
+  for (let iy = 0; iy < rows; iy += 1) {
+    for (let ix = 0; ix < cols; ix += 1) {
+      center.set(
+        bounds.min.x + ((ix + 0.5) / cols) * sizeX,
+        bounds.min.y + ((iy + 0.5) / rows) * sizeY,
+      );
+      if (!isPointInPolygon(center, outline)) continue;
+
+      const a = addVertex(ix, iy);
+      const b = addVertex(ix + 1, iy);
+      const c = addVertex(ix + 1, iy + 1);
+      const d = addVertex(ix, iy + 1);
+
+      indices.push(a, b, d, b, c, d);
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(positions, 3),
+  );
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeBoundingBox();
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
 function createReservoirShape(path: ReservoirPathCommand[]) {
   const shape = new THREE.Shape();
 
@@ -182,14 +256,10 @@ export function ReservoirWater({
     [reservoir.path],
   );
 
-  const waterGeometry = useMemo(() => {
-    const geometry = new THREE.ShapeGeometry(
-      reservoirShape,
-      reservoir.segments,
-    );
-    geometry.computeBoundingBox();
-    return geometry;
-  }, [reservoir.segments, reservoirShape]);
+  const waterGeometry = useMemo(
+    () => createTessellatedWaterGeometry(reservoirShape, reservoir.segments * 2),
+    [reservoir.segments, reservoirShape],
+  );
 
   const shapePolygon = useMemo(
     () => reservoirShape.getSpacedPoints(128),
@@ -230,7 +300,9 @@ export function ReservoirWater({
     for (let i = 0; i < positions.count; i++) {
       const x = positions.getX(i);
       const y = positions.getY(i);
-      const terrainHeight = terrainSampler.getHeight(x, y);
+      const worldX = reservoir.position[0] + x * reservoir.bedScale;
+      const worldZ = reservoir.position[2] - y * reservoir.bedScale;
+      const terrainHeight = terrainSampler.getHeight(worldX, worldZ);
       positions.setZ(i, terrainHeight);
       if (terrainHeight < minH) minH = terrainHeight;
       if (terrainHeight > maxH) maxH = terrainHeight;
@@ -247,7 +319,7 @@ export function ReservoirWater({
     (geometry as unknown as { __terrainStats: TerrainStats }).__terrainStats =
       stats;
     return geometry;
-  }, [terrainSampler, waterGeometry]);
+  }, [reservoir.bedScale, reservoir.position, terrainSampler, waterGeometry]);
 
   const bedPositionY = useMemo(() => {
     const stats = (bedGeometry as unknown as { __terrainStats?: TerrainStats })
@@ -256,20 +328,62 @@ export function ReservoirWater({
     return stats.avgH - 0.02;
   }, [bedGeometry]);
 
-  useMemo(() => {
-    const geom = waterGeometry;
-    const count = geom.attributes.position.count;
-    const shore = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-      const x = geom.attributes.position.getX(i);
-      const y = geom.attributes.position.getY(i);
-      const terrainH = terrainSampler.getHeight(x, y);
-      const depth = waterElevation - terrainH;
-      const t = Math.max(0, Math.min(1, depth / reservoir.foamWidth));
-      shore[i] = 1.0 - t;
-    }
-    geom.setAttribute("aShore", new THREE.BufferAttribute(shore, 1));
-  }, [reservoir.foamWidth, terrainSampler, waterElevation, waterGeometry]);
+  // Per-vertex water depth (waterElevation - terrainHeight) drives both the
+  // shoreline carving (in the shader) and the deep-water tint. We attach it to
+  // the surface and the bed so they share the exact same waterline.
+  //
+  // Crucially, the water group is rotated (-90deg around X), scaled and offset
+  // before it reaches world space, so a shape-local vertex (x, y) ends up at
+  // world (posX + x*scaleX, *, posZ - y*scaleY). We must sample the terrain at
+  // that world position, otherwise the carved lake never lines up with the
+  // relief and the water just floats over the hills.
+  const [posX, , posZ] = reservoir.position;
+  const surfaceWorldY = reservoir.position[1] + waterElevation;
+
+  const depthRange = useMemo(() => {
+    let maxDepth = 0.0001;
+
+    const annotate = (
+      geom: THREE.BufferGeometry,
+      scaleX: number,
+      scaleY: number,
+    ) => {
+      const position = geom.attributes.position;
+      const count = position.count;
+      const shore = new Float32Array(count);
+      const depthAttr = new Float32Array(count);
+      for (let i = 0; i < count; i++) {
+        const localX = position.getX(i);
+        const localY = position.getY(i);
+        const worldX = posX + localX * scaleX;
+        const worldZ = posZ - localY * scaleY;
+        const terrainH = terrainSampler.getHeight(worldX, worldZ);
+        const depth = surfaceWorldY - terrainH;
+        depthAttr[i] = depth;
+        if (depth > maxDepth) maxDepth = depth;
+        const t = Math.max(0, Math.min(1, depth / reservoir.foamWidth));
+        shore[i] = 1.0 - t;
+      }
+      geom.setAttribute("aShore", new THREE.BufferAttribute(shore, 1));
+      geom.setAttribute("aDepth", new THREE.BufferAttribute(depthAttr, 1));
+    };
+
+    annotate(waterGeometry, waterScaleX, waterScaleY);
+    annotate(bedGeometry, reservoir.bedScale, reservoir.bedScale);
+
+    return maxDepth;
+  }, [
+    bedGeometry,
+    posX,
+    posZ,
+    reservoir.bedScale,
+    reservoir.foamWidth,
+    surfaceWorldY,
+    terrainSampler,
+    waterGeometry,
+    waterScaleX,
+    waterScaleY,
+  ]);
 
   const waterMaterial = useMemo(() => {
     const material = new THREE.ShaderMaterial({
@@ -286,6 +400,7 @@ export function ReservoirWater({
         uRippleSpeed: { value: 1.5 },
         uWaveAmp: { value: 0.03 },
         uFresnelStrength: { value: 0.55 },
+        uDepthRange: { value: Math.max(depthRange * 0.85, 0.1) },
         uBounds: { value: waterBounds },
         uBaseColor: { value: new THREE.Color(reservoir.waterColors.base) },
         uDeepColor: { value: new THREE.Color(reservoir.waterColors.deep) },
@@ -296,7 +411,7 @@ export function ReservoirWater({
       },
     });
     return material;
-  }, [reservoir.waterColors, waterBounds]);
+  }, [depthRange, reservoir.waterColors, waterBounds]);
 
   const bedMaterial = useMemo(() => {
     return new THREE.ShaderMaterial({
